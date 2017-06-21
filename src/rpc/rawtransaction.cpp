@@ -11,6 +11,7 @@
 #include "init.h"
 #include "keystore.h"
 #include "validation.h"
+#include "validationinterface.h"
 #include "merkleblock.h"
 #include "net.h"
 #include "policy/policy.h"
@@ -30,6 +31,7 @@
 #include "wallet/wallet.h"
 #endif
 
+#include <future>
 #include <stdint.h>
 
 #include <univalue.h>
@@ -917,6 +919,11 @@ UniValue sendrawtransaction(const JSONRPCRequest& request)
         );
 
     ObserveSafeMode();
+
+    CTransactionRef tx;
+    std::promise<void> promise;
+
+    { // cs_main scope
     LOCK(cs_main);
     RPCTypeCheck(request.params, {UniValue::VSTR, UniValue::VBOOL});
 
@@ -924,7 +931,7 @@ UniValue sendrawtransaction(const JSONRPCRequest& request)
     CMutableTransaction mtx;
     if (!DecodeHexTx(mtx, request.params[0].get_str()))
         throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "TX decode failed");
-    CTransactionRef tx(MakeTransactionRef(std::move(mtx)));
+    tx = MakeTransactionRef(std::move(mtx));
     const uint256& hashTx = tx->GetHash();
 
     CAmount nMaxRawTxFee = maxTxFee;
@@ -942,7 +949,7 @@ UniValue sendrawtransaction(const JSONRPCRequest& request)
         // push to local node and sync with wallets
         CValidationState state;
         bool fMissingInputs;
-        if (!AcceptToMemoryPool(mempool, state, std::move(tx), &fMissingInputs,
+        if (!AcceptToMemoryPool(mempool, state, tx, &fMissingInputs,
                                 nullptr /* plTxnReplaced */, false /* bypass_limits */, nMaxRawTxFee)) {
             if (state.IsInvalid()) {
                 throw JSONRPCError(RPC_TRANSACTION_REJECTED, strprintf("%i: %s", state.GetRejectCode(), state.GetRejectReason()));
@@ -952,19 +959,34 @@ UniValue sendrawtransaction(const JSONRPCRequest& request)
                 }
                 throw JSONRPCError(RPC_TRANSACTION_ERROR, state.GetRejectReason());
             }
+        } else {
+            // If wallet is enabled, ensure that the wallet has been made aware
+            // of the new transaction prior to returning. This prevents a race
+            // where a user might call sendrawtransaction with a transaction
+            // to/from their wallet, immediately call some wallet RPC, and get
+            // a stale result because callbacks have not yet been processed.
+            CallFunctionInValidationInterfaceQueue([&promise] {
+                promise.set_value();
+            });
         }
     } else if (fHaveChain) {
         throw JSONRPCError(RPC_TRANSACTION_ALREADY_IN_CHAIN, "transaction already in block chain");
     }
+
+    } // cs_main
+
+    promise.get_future().wait();
+
     if(!g_connman)
         throw JSONRPCError(RPC_CLIENT_P2P_DISABLED, "Error: Peer-to-peer functionality missing or disabled");
 
-    CInv inv(MSG_TX, hashTx);
+    CInv inv(MSG_TX, tx->GetHash());
     g_connman->ForEachNode([&inv](CNode* pnode)
     {
         pnode->PushInventory(inv);
     });
-    return hashTx.GetHex();
+
+    return tx->GetHash().GetHex();
 }
 
 static const CRPCCommand commands[] =
