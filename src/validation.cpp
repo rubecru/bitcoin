@@ -64,7 +64,6 @@ CCriticalSection cs_main;
 
 BlockMap mapBlockIndex;
 CChain chainActive;
-CBlockIndex *pindexBestHeader = nullptr;
 CWaitableCriticalSection csBestBlock;
 CConditionVariable cvBlockChange;
 int nScriptCheckThreads = 0;
@@ -124,6 +123,7 @@ namespace {
     };
 
     CBlockIndex *pindexBestInvalid;
+    CBlockIndex *pindexBestHeader = nullptr;
 
     /**
      * The set of all CBlockIndex entries with BLOCK_VALID_TRANSACTIONS (for itself and all ancestors) and
@@ -377,7 +377,7 @@ static bool IsCurrentForFeeEstimation()
         return false;
     if (chainActive.Tip()->GetBlockTime() < (GetTime() - MAX_FEE_ESTIMATION_TIP_AGE))
         return false;
-    if (chainActive.Height() < pindexBestHeader->nHeight - 1)
+    if (chainActive.Height() < GetBestHeader()->nHeight - 1)
         return false;
     return true;
 }
@@ -1088,7 +1088,7 @@ bool IsInitialBlockDownload()
     return false;
 }
 
-CBlockIndex *pindexBestForkTip = nullptr, *pindexBestForkBase = nullptr;
+static CBlockIndex *pindexBestForkTip = nullptr, *pindexBestForkBase = nullptr;
 
 static void AlertNotify(const std::string& strMessage)
 {
@@ -1248,6 +1248,14 @@ static void MaybeAddNewHeaderCandidate(CBlockIndex* pindex, bool chain_ordered_i
     }
 
     setBlockIndexHeaderCandidates.insert(pindex);
+}
+
+const CBlockIndex* GetBestHeader() {
+    LOCK(cs_main);
+    auto it = setBlockIndexHeaderCandidates.rbegin();
+    if (it == setBlockIndexHeaderCandidates.rend())
+        return nullptr;
+    return *it;
 }
 
 // Helper for PruneInvalidBlockIndexCandidates
@@ -1818,6 +1826,8 @@ static bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockInd
                 pindexBestHeader->GetAncestor(pindex->nHeight) == pindex &&
                 pindexBestHeader->nChainWork >= nMinimumChainWork) {
                 // This block is a member of the assumed verified chain and an ancestor of the best header.
+                // Note that we use pindexBestHeader here, not GetBestHeader(), ignoring potential
+                // chain-invalidity of the best header.
                 // The equivalent time check discourages hash power from extorting the network via DOS attack
                 //  into accepting an invalid block through telling users they must manually set assumevalid.
                 //  Requiring a software change or burying the invalid block, regardless of the setting, makes
@@ -2547,11 +2557,11 @@ static bool ActivateBestChainStep(CValidationState& state, const CChainParams& c
 static void NotifyHeaderTip() {
     bool fNotify = false;
     bool fInitialBlockDownload = false;
-    static CBlockIndex* pindexHeaderOld = nullptr;
-    CBlockIndex* pindexHeader = nullptr;
+    static const CBlockIndex* pindexHeaderOld = nullptr;
+    const CBlockIndex* pindexHeader = nullptr;
     {
         LOCK(cs_main);
-        pindexHeader = pindexBestHeader;
+        pindexHeader = GetBestHeader();
 
         if (pindexHeader != pindexHeaderOld) {
             fNotify = true;
